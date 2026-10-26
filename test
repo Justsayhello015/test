@@ -1,0 +1,36 @@
+import collections, hashlib, re
+from pathlib import Path
+from chatbot.company_setup import local_path
+from chatbot.ingestion.wiki.sections import load_sections
+
+secs = load_sections(Path(local_path(WIKI_DIR)), 12000).sections
+total = sum(len(s.text) for s in secs)
+pct = lambda n: f"{n:,} ký tự ({n / total:.0%})"
+FORMAT_NOISE = re.compile(
+    r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+"  # ảnh nhúng base64
+    r"|!\[[^\]\n]*\]\([^)\n]*\)"  # ảnh dạng link
+    r"|</?[A-Za-z][^<>\n]{0,500}>"  # thẻ HTML
+)
+size, noise, repeated = collections.Counter(), collections.Counter(), collections.Counter()
+seen = set()
+for s in secs:
+    size[s.file] += len(s.text)
+    noise[s.file] += sum(len(m) for m in FORMAT_NOISE.findall(s.text))
+    for line in s.text.split("\n"):
+        key = " ".join(line.split()).lower()
+        if len(key) < 20:
+            continue
+        digest = hashlib.sha1(key.encode()).digest()
+        if digest in seen:
+            repeated[s.file] += len(line)
+        else:
+            seen.add(digest)
+
+print("Số file .md:", len(size), "| Tổng:", f"{total:,} ký tự")
+print("Rác định dạng (ảnh base64, ảnh, thẻ HTML):", pct(sum(noise.values())))
+print("Dòng đã xuất hiện ở chỗ khác (header/footer PDF, bản sao):", pct(sum(repeated.values())))
+top = size.most_common(20)
+print("20 file lớn nhất chiếm:", pct(sum(n for _, n in top)))
+print(f"{'ký tự':>12} | {'% tổng':>6} | {'% rác':>5} | {'% lặp':>5} | file")
+for file, n in top:
+    print(f"{n:>12,} | {n / total:>6.1%} | {noise[file] / n:>5.0%} | {repeated[file] / n:>5.0%} | {file[:90]}")
