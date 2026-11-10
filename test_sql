@@ -1,0 +1,18 @@
+SELECT rptdate_detail                                            AS luc,
+       get_json_object(reply_meta, '$.action')                   AS action,
+       get_json_object(reply_meta, '$.question_kind')            AS question_kind,
+       get_json_object(reply_meta, '$.thinking.steps[*].title')  AS cac_buoc_trong_khung,
+       tool_calls_log IS NULL                                    AS log_trong,
+       left(tool_calls_log, 150)                                 AS dau_log,
+       get_json_object(tool_calls_log, '$.steps[*].reason')      AS tim_so_ket_qua,
+       get_json_object(tool_calls_log, '$.steps[*].picked_by')   AS tim_so_ai_chon,
+       get_json_object(tool_calls_log, '$.steps[*].name_kinds')  AS tim_so_theo,
+       get_json_object(tool_calls_log, '$.steps[*].outcome')     AS boc_cong_thuc,
+       get_json_object(tool_calls_log, '$.steps[*].errors')      AS boc_loi,
+       get_json_object(tool_calls_log, '$.steps[*].checks')      AS boc_kiem
+FROM `<catalog>`.`<schema>`.`chatbot_message`
+WHERE role = 'assistant'
+  AND user_email = '<email của anh>'
+  AND to_date(rptdate_detail) >= date_sub(current_date(), 1)
+ORDER BY luc DESC
+LIMIT 10;
