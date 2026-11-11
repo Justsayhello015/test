@@ -1,17 +1,84 @@
-import json, pathlib, re, collections
-from chatbot.facetest import questions as q
-mau = [(m, re.compile(re.sub(r"\\\{\w+\\\}", "(.*)", re.escape(m)), re.S))
-       for m in (*q.ONE_TILE, *q.SEVERAL_TILES, *q.WITH_DAX_AND_SQL, *q.BY_NAME)]
-cau = {c["case_id"]: c["turns"][0] for c in json.load(open(f"{FACETEST_DIR}/cases.json", encoding="utf-8"))["cases"]}
-runs = sorted(pathlib.Path(f"{FACETEST_DIR}/runs").iterdir(), key=lambda p: p.stat().st_mtime)
-dem = collections.Counter()
-for line in open(runs[-1] / "results.jsonl", encoding="utf-8"):
-    r = json.loads(line)
-    if r["status"] != "scored":
-        continue
-    steps = json.loads(r["tool_calls_log"][0] or "{}").get("steps", [])
-    co_tim = any(s["step"] == "numbers" for s in steps)
-    m = next((m for m, p in mau if p.fullmatch(cau.get(r["case_id"], ""))), "?")
-    dem[(m, "có tìm ô" if co_tim else "KHÔNG tìm ô")] += 1
-for (m, kq), so in sorted(dem.items()):
-    print(so, kq, "|", m)
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from chatbot.agent.history import parse_reply_meta
+from chatbot.facetest.store import FaceTestStore
+from chatbot.formula.candidates import read_number_key
+
+
+def _steps(log):
+    try:
+        steps = json.loads(log).get("steps", [])
+    except (ValueError, AttributeError):
+        return []
+    return [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+
+
+def _formulas(meta):
+    if meta is None:
+        return []
+    found = [n.formula for n in meta.numbers]
+    return ([meta.formula] if meta.formula is not None else []) + found
+
+
+def diagnose(folder):
+    root = Path(folder)
+    store = FaceTestStore(root)
+    run = max((root / "runs").iterdir(), key=lambda p: p.stat().st_mtime).name
+    cases = {c.case_id: c for c in store.read_cases().cases}
+    results = [r for r in store.read_results(run) if r.status == "scored"]
+    by_kind = defaultdict(Counter)
+    steps_seen = Counter()
+    for result in results:
+        case = cases[result.case_id]
+        meta = parse_reply_meta(result.reply_meta[-1]) if result.reply_meta else None
+        unfolded = _formulas(meta)
+        count = by_kind[result.kind]
+        count[f"ô cần tìm={len(case.tiles)}"] += 1
+        count[f"số đã bóc={len(unfolded)}"] += 1
+        if meta is not None and meta.pending_clarification is not None:
+            pending = meta.pending_clarification
+            keys = [read_number_key(o.meaning_value) for o in pending.options]
+            wanted = {t.tile.visual_id for t in case.tiles}
+            measures = {t.tile.measure.casefold() for t in case.tiles}
+            count[f"hỏi lại:{pending.kind}:{len(pending.options)} nút"] += 1
+            count["hỏi lại: có nút đúng ô" if any(k and k[1] in wanted for k in keys)
+                  else "hỏi lại: không có nút đúng ô"] += 1
+            count["hỏi lại: có nút đúng chỉ tiêu" if any(k and k[2].casefold() in measures for k in keys)
+                  else "hỏi lại: không có nút đúng chỉ tiêu"] += 1
+        for tile, expect in zip(result.tiles, case.tiles):
+            if tile.found:
+                continue
+            want = expect.tile
+            same = [f for f in unfolded if f.measure_name.casefold() == want.measure.casefold()]
+            if not unfolded:
+                count["không tìm ra: không bóc số nào"] += 1
+            elif not same:
+                count["không tìm ra: bóc chỉ tiêu khác"] += 1
+            elif any(f.page_id == want.page_id for f in same):
+                count["không tìm ra: đúng chỉ tiêu, cùng trang, ô khác"] += 1
+            elif any(f.visual_id is None for f in same):
+                count["không tìm ra: đúng chỉ tiêu, không theo ô nào"] += 1
+            else:
+                count["không tìm ra: đúng chỉ tiêu, trang khác"] += 1
+        for log in result.tool_calls_log:
+            for step in _steps(log):
+                if step.get("step") != "formula":
+                    continue
+                steps_seen[f"outcome:{step.get('outcome')}"] += 1
+                steps_seen[f"sql_status:{step.get('sql_status')}"] += 1
+                for key in ("errors", "checks", "sql_checks"):
+                    for code in step.get(key) or []:
+                        steps_seen[f"{key}:{code}"] += 1
+    print(f"Lần chạy: {len(results)} câu đã chấm")
+    for kind in sorted(by_kind):
+        print(f"\n{kind}")
+        for code, n in sorted(by_kind[kind].items()):
+            print(f"  {code}: {n}")
+    print("\nBước bóc công thức (mọi lượt):")
+    for code, n in steps_seen.most_common():
+        print(f"  {code}: {n}")
+
+
+diagnose(FACETEST_DIR)
