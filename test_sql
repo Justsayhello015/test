@@ -1,19 +1,20 @@
-WITH steps AS (
-  SELECT rptdate_detail AS at,
-         explode(from_json(tool_calls_log, 'struct<steps:array<string>>').steps) AS step
-  FROM `<catalog>`.`<schema>`.`<bảng lịch sử chat>`
-  WHERE role = 'assistant' AND tool_calls_log IS NOT NULL
-    AND to_date(rptdate_detail) >= date_sub(current_date(), 1)
-)
-SELECT at,
-       get_json_object(step, '$.outcome')           AS outcome,
-       get_json_object(step, '$.levels')            AS levels,
-       get_json_object(step, '$.filters')           AS filters,
-       get_json_object(step, '$.branch_source')     AS branch_source,
-       get_json_object(step, '$.unpicked_branches') AS unpicked_branches,
-       get_json_object(step, '$.sql_status')        AS sql_status,
-       get_json_object(step, '$.errors')            AS errors,
-       get_json_object(step, '$.checks')            AS checks
-FROM steps
-WHERE get_json_object(step, '$.step') = 'formula'
-ORDER BY at DESC;
+import json, pathlib, collections
+runs = sorted(pathlib.Path(f"{FACETEST_DIR}/runs").iterdir(), key=lambda p: p.stat().st_mtime)
+dem = collections.Counter()
+for line in open(runs[-1] / "results.jsonl", encoding="utf-8"):
+    r = json.loads(line)
+    if r["status"] != "scored":
+        dem[f"trạng thái:{r['status']}"] += 1
+        continue
+    meta = json.loads(r["reply_meta"][-1] or "{}")
+    hoi = (meta.get("pending_clarification") or {}).get("kind")
+    steps = json.loads(r["tool_calls_log"][-1] or "{}").get("steps", [])
+    num = next((s for s in steps if s["step"] == "numbers"), None)
+    cong_thuc = [s.get("outcome") for s in steps if s["step"] == "formula"]
+    tim = sum(1 for t in r["tiles"] if t["found"])
+    print(r["kind"], f"tìm {tim}/{len(r['tiles'])}", "| bot hỏi lại:", hoi,
+          "| numbers:", None if num is None else (num["reason"], num["outcomes"], num["candidates"], num["picked_by"]),
+          "| công thức:", cong_thuc)
+    dem[f"bot hỏi lại:{hoi}"] += 1
+    dem["numbers:" + ("không chạy" if num is None else str(num["reason"]))] += 1
+print(dict(dem))
