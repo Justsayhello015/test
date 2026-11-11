@@ -1,17 +1,17 @@
-import json, pathlib, collections
+import json, pathlib, re, collections
+from chatbot.facetest import questions as q
+mau = [(m, re.compile(re.sub(r"\\\{\w+\\\}", "(.*)", re.escape(m)), re.S))
+       for m in (*q.ONE_TILE, *q.SEVERAL_TILES, *q.WITH_DAX_AND_SQL, *q.BY_NAME)]
+cau = {c["case_id"]: c["turns"][0] for c in json.load(open(f"{FACETEST_DIR}/cases.json", encoding="utf-8"))["cases"]}
 runs = sorted(pathlib.Path(f"{FACETEST_DIR}/runs").iterdir(), key=lambda p: p.stat().st_mtime)
 dem = collections.Counter()
 for line in open(runs[-1] / "results.jsonl", encoding="utf-8"):
     r = json.loads(line)
     if r["status"] != "scored":
         continue
-    meta = json.loads(r["reply_meta"][-1] or "{}")
-    steps = json.loads(r["tool_calls_log"][-1] or "{}").get("steps", [])
-    if any(s["step"] == "numbers" for s in steps):
-        continue
-    hieu = next((s for s in steps if s["step"] == "understand"), {})
-    khoa = (r["kind"], meta.get("intent"), meta.get("action"), meta.get("rule_id"), hieu.get("fallback"))
-    print(*khoa, "| số lượt:", len(r["tool_calls_log"]))
-    dem[khoa[1:]] += 1
-for khoa, so in dem.most_common():
-    print(so, khoa)
+    steps = json.loads(r["tool_calls_log"][0] or "{}").get("steps", [])
+    co_tim = any(s["step"] == "numbers" for s in steps)
+    m = next((m for m, p in mau if p.fullmatch(cau.get(r["case_id"], ""))), "?")
+    dem[(m, "có tìm ô" if co_tim else "KHÔNG tìm ô")] += 1
+for (m, kq), so in sorted(dem.items()):
+    print(so, kq, "|", m)
