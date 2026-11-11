@@ -1,14 +1,19 @@
-SELECT get_json_object(reply_meta, '$.action')                   AS action,
-       tool_calls_log IS NULL                                    AS log_trong,
-       get_json_object(tool_calls_log, '$.steps[*].outcome')     AS boc_kq,
-       get_json_object(tool_calls_log, '$.steps[*].errors')      AS loi,
-       get_json_object(tool_calls_log, '$.steps[*].checks')      AS kiem_hong,
-       get_json_object(tool_calls_log, '$.steps[*].levels')      AS so_tang,
-       get_json_object(tool_calls_log, '$.steps[*].filters')     AS so_loc,
-       get_json_object(tool_calls_log, '$.steps[*].tree_tokens') AS do_dai,
-       get_json_object(tool_calls_log, '$.steps[*].cut_levels')  AS tang_bi_cat
-FROM `<catalog>`.`<schema>`.`chatbot_message`
-WHERE role = 'assistant' AND user_email = '<email của anh>'
-  AND to_date(rptdate_detail) >= date_sub(current_date(), 1)
-ORDER BY rptdate_detail DESC
-LIMIT 3;
+WITH steps AS (
+  SELECT rptdate_detail AS at,
+         explode(from_json(tool_calls_log, 'struct<steps:array<string>>').steps) AS step
+  FROM `<catalog>`.`<schema>`.`<bảng lịch sử chat>`
+  WHERE role = 'assistant' AND tool_calls_log IS NOT NULL
+    AND to_date(rptdate_detail) >= date_sub(current_date(), 1)
+)
+SELECT at,
+       get_json_object(step, '$.outcome')           AS outcome,
+       get_json_object(step, '$.levels')            AS levels,
+       get_json_object(step, '$.filters')           AS filters,
+       get_json_object(step, '$.branch_source')     AS branch_source,
+       get_json_object(step, '$.unpicked_branches') AS unpicked_branches,
+       get_json_object(step, '$.sql_status')        AS sql_status,
+       get_json_object(step, '$.errors')            AS errors,
+       get_json_object(step, '$.checks')            AS checks
+FROM steps
+WHERE get_json_object(step, '$.step') = 'formula'
+ORDER BY at DESC;
