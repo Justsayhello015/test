@@ -1,84 +1,112 @@
+# Ô đọc kết quả bài kiểm (018 đợt 2). Chạy sau ô Cấu hình. Chỉ in mã và số đếm:
+# không in tên báo cáo, trang, ô, cột hay giá trị nào.
 import json
-from collections import Counter, defaultdict
+import textwrap
+from collections import Counter
 from pathlib import Path
 
-from chatbot.agent.history import parse_reply_meta
 from chatbot.facetest.store import FaceTestStore
-from chatbot.formula.candidates import read_number_key
+
+folder = Path(FACETEST_DIR)
+summary = FaceTestStore(folder).last_finished()
+results = [
+    r
+    for r in FaceTestStore(folder).read_results(summary.run_key)
+    if r.status in ("scored", "error")
+]
+case_file = folder / "cases.json"
+cases = json.loads(case_file.read_text(encoding="utf-8"))
+if cases["list_id"] != summary.list_id:
+    case_file = folder / f"cases-{summary.list_id}.json"
+    cases = json.loads(case_file.read_text(encoding="utf-8"))
+case_by_id = {case["case_id"]: case for case in cases["cases"]}
 
 
-def _steps(log):
+def steps_of(result):
     try:
-        steps = json.loads(log).get("steps", [])
-    except (ValueError, AttributeError):
+        steps = json.loads(result.tool_calls_log[-1])["steps"]
+    except (IndexError, ValueError, KeyError, TypeError):
         return []
-    return [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+    return [step for step in steps if isinstance(step, dict)]
 
 
-def _formulas(meta):
-    if meta is None:
-        return []
-    found = [n.formula for n in meta.numbers]
-    return ([meta.formula] if meta.formula is not None else []) + found
+def last(steps, name):
+    return next((s for s in reversed(steps) if s.get("step") == name), {})
 
 
-def diagnose(folder):
-    root = Path(folder)
-    store = FaceTestStore(root)
-    run = max((root / "runs").iterdir(), key=lambda p: p.stat().st_mtime).name
-    cases = {c.case_id: c for c in store.read_cases().cases}
-    results = [r for r in store.read_results(run) if r.status == "scored"]
-    by_kind = defaultdict(Counter)
-    steps_seen = Counter()
-    for result in results:
-        case = cases[result.case_id]
-        meta = parse_reply_meta(result.reply_meta[-1]) if result.reply_meta else None
-        unfolded = _formulas(meta)
-        count = by_kind[result.kind]
-        count[f"ô cần tìm={len(case.tiles)}"] += 1
-        count[f"số đã bóc={len(unfolded)}"] += 1
-        if meta is not None and meta.pending_clarification is not None:
-            pending = meta.pending_clarification
-            keys = [read_number_key(o.meaning_value) for o in pending.options]
-            wanted = {t.tile.visual_id for t in case.tiles}
-            measures = {t.tile.measure.casefold() for t in case.tiles}
-            count[f"hỏi lại:{pending.kind}:{len(pending.options)} nút"] += 1
-            count["hỏi lại: có nút đúng ô" if any(k and k[1] in wanted for k in keys)
-                  else "hỏi lại: không có nút đúng ô"] += 1
-            count["hỏi lại: có nút đúng chỉ tiêu" if any(k and k[2].casefold() in measures for k in keys)
-                  else "hỏi lại: không có nút đúng chỉ tiêu"] += 1
-        for tile, expect in zip(result.tiles, case.tiles):
-            if tile.found:
-                continue
-            want = expect.tile
-            same = [f for f in unfolded if f.measure_name.casefold() == want.measure.casefold()]
-            if not unfolded:
-                count["không tìm ra: không bóc số nào"] += 1
-            elif not same:
-                count["không tìm ra: bóc chỉ tiêu khác"] += 1
-            elif any(f.page_id == want.page_id for f in same):
-                count["không tìm ra: đúng chỉ tiêu, cùng trang, ô khác"] += 1
-            elif any(f.visual_id is None for f in same):
-                count["không tìm ra: đúng chỉ tiêu, không theo ô nào"] += 1
-            else:
-                count["không tìm ra: đúng chỉ tiêu, trang khác"] += 1
-        for log in result.tool_calls_log:
-            for step in _steps(log):
-                if step.get("step") != "formula":
-                    continue
-                steps_seen[f"outcome:{step.get('outcome')}"] += 1
-                steps_seen[f"sql_status:{step.get('sql_status')}"] += 1
-                for key in ("errors", "checks", "sql_checks"):
-                    for code in step.get(key) or []:
-                        steps_seen[f"{key}:{code}"] += 1
-    print(f"Lần chạy: {len(results)} câu đã chấm")
-    for kind in sorted(by_kind):
-        print(f"\n{kind}")
-        for code, n in sorted(by_kind[kind].items()):
-            print(f"  {code}: {n}")
-    print("\nBước bóc công thức (mọi lượt):")
-    for code, n in steps_seen.most_common():
-        print(f"  {code}: {n}")
+def source_kind(code):
+    # "bảng:loại[:nguồn]" -> "loại[:nguồn]": bỏ tên bảng
+    parts = str(code).split(":")
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i] in ("external", "derived", "unresolved"):
+            return ":".join(parts[i:])
+    return "?"
 
 
-diagnose(FACETEST_DIR)
+def bucket(n):
+    n = n or 0
+    return "0" if n == 0 else "1-5" if n <= 5 else "6-20" if n <= 20 else ">20"
+
+
+all_codes = Counter()
+other = Counter()
+branch = Counter()
+no_match = Counter()
+no_sql = Counter()
+for result in results:
+    case = case_by_id.get(result.case_id, {})
+    expects = {t["tile"]["visual_id"]: t for t in case.get("tiles", [])}
+    steps = steps_of(result)
+    numbers = last(steps, "numbers")
+    formula = last(steps, "formula")
+    pick = last(steps, "llm_checks").get("calls", {}).get("pick_numbers", {})
+    for tile in result.tiles:
+        all_codes.update(tile.codes)
+        why = next((c[4:] for c in tile.codes if c.startswith("why:")), "")
+        expect = expects.get(tile.visual_id, {})
+        if why.startswith("other_tile:other_measure"):
+            other.update(f"kết quả khớp:{o}" for o in numbers.get("outcomes") or [])
+            other.update(f"loại tên:{k}" for k in numbers.get("name_kinds") or [])
+            other[f"cụm chữ/ô hỏi:{numbers.get('phrases', 0)}/{len(expects)}"] += 1
+        if why == "no_target:branch_listing":
+            formula = next(
+                (
+                    s
+                    for s in reversed(steps)
+                    if s.get("step") == "formula" and s.get("outcome") == "branch_listing"
+                ),
+                formula,
+            )
+            branch[f"kiểu câu:{result.kind}"] += 1
+            branch[f"bài kiểm biết nhánh:{'có' if expect.get('branch') else 'không'}"] += 1
+            branch[f"lọc trên ảnh:{bucket(len(case.get('slicer_values') or []))}"] += 1
+            branch[f"lọc trong câu:{bucket(len(case.get('question_values') or []))}"] += 1
+            branch[f"bot biết nhánh từ:{formula.get('branch_source')}"] += 1
+            branch[f"nhánh chưa chọn:{bucket(formula.get('unpicked_branches'))}"] += 1
+            branch[f"cột chờ chọn:{bucket(len(formula.get('unpicked_columns') or []))}"] += 1
+        if why.startswith("no_target:no_match"):
+            no_match[f"ứng viên:{bucket(numbers.get('candidates'))}"] += 1
+            no_match.update(f"kết quả khớp:{o}" for o in numbers.get("outcomes") or [])
+            for key in ("errors", "rules", "checks"):
+                no_match.update(f"model chọn {key}:{c}" for c in pick.get(key) or [])
+    for step in steps:
+        if step.get("step") != "formula" or step.get("sql_status") != "blocked":
+            continue
+        no_sql[f"chặn:{','.join(step.get('sql_blocks') or []) or 'không mã'}"] += 1
+        no_sql.update(f"nguồn ngoài:{source_kind(c)}" for c in step.get("external_tables") or [])
+        no_sql[f"tầng cắt:{bucket(step.get('cut_levels'))}"] += 1
+        no_sql[f"cây:{step.get('outcome')}"] += 1
+
+
+def show(title, counter):
+    items = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+    text = f"{title}: " + " · ".join(f"{k} {n}" for k, n in items)
+    print(textwrap.fill(text, width=100, subsequent_indent="    ", break_on_hyphens=False))
+
+
+print(f"Lần chạy {summary.run_key[:40]} · câu {len(results)} · ô {sum(len(r.tiles) for r in results)}")
+show("A. Mọi mã theo ô", all_codes)
+show("B. Ô bot chọn ô khác, chỉ tiêu khác", other)
+show("C. Ô bot liệt kê nhánh", branch)
+show("D. Ô model không thấy ô nào khớp", no_match)
+show("E. Bước bóc bị chặn SQL", no_sql)
