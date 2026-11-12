@@ -1,112 +1,223 @@
-# Ô đọc kết quả bài kiểm (018 đợt 2). Chạy sau ô Cấu hình. Chỉ in mã và số đếm:
-# không in tên báo cáo, trang, ô, cột hay giá trị nào.
-import json
+# Ô đo tìm ô bằng code (018 đợt 2, bước 1). Chạy sau ô Cấu hình (cần DIVISIONS, FACETEST_DIR).
+# Không gọi model, không ghi file nào, chạy vài giây. Chỉ in mã và số đếm: không in tên báo cáo,
+# trang, ô, cột hay giá trị nào.
+# BIG_LIST = False: 50 câu của lần chạy ô 6 gần nhất (so được với kết quả thật).
+# BIG_LIST = True: tạo thêm danh sách lớn trong bộ nhớ (không lưu) để có nhiều ô hơn.
+BIG_LIST = False
+BIG_CASES, BIG_PER_REPORT = 400, 40
+
+import dataclasses
 import textwrap
 from collections import Counter
 from pathlib import Path
 
+from chatbot.agent.types import Attachment, Mention, SubQuestion
+from chatbot.config import load_agent_config
+from chatbot.facetest.ask import IMAGE_NAME, twins_of
+from chatbot.facetest.cases import make_cases
 from chatbot.facetest.store import FaceTestStore
+from chatbot.formula import face
+from chatbot.formula import locate as loc
+from chatbot.formula.candidates import match, number_candidates, read_number_key
+from chatbot.knowledge import AllowedDivisions, KnowledgeSearch
+from chatbot.textnorm import normalize_name
 
-folder = Path(FACETEST_DIR)
-summary = FaceTestStore(folder).last_finished()
-results = [
-    r
-    for r in FaceTestStore(folder).read_results(summary.run_key)
-    if r.status in ("scored", "error")
-]
-case_file = folder / "cases.json"
-cases = json.loads(case_file.read_text(encoding="utf-8"))
-if cases["list_id"] != summary.list_id:
-    case_file = folder / f"cases-{summary.list_id}.json"
-    cases = json.loads(case_file.read_text(encoding="utf-8"))
-case_by_id = {case["case_id"]: case for case in cases["cases"]}
+if "search" not in globals():
+    config = load_agent_config()
+    retrieval = dataclasses.replace(config.retrieval, refresh_seconds=0)
+    search = KnowledgeSearch.from_config(retrieval)
+allowed = AllowedDivisions.parse(DIVISIONS)
+store = FaceTestStore(Path(FACETEST_DIR))
+real_why: dict[tuple[str, str], str] = {}
+if BIG_LIST:
+    run_id = search.check().run_id
+    case_list = make_cases(
+        search, allowed, run_id=run_id, cases=BIG_CASES, per_report=BIG_PER_REPORT, made_at=""
+    )
+else:
+    case_list = store.read_cases()
+    last = store.last_finished()
+    if last is not None and last.list_id == case_list.list_id:
+        for result in store.read_results(last.run_key):
+            for tile in result.tiles:
+                why = next((c[4:] for c in tile.codes if c.startswith("why:")), "")
+                parts = why.split(":")
+                short = ":".join(parts[:2]) if parts[0] in ("other_tile", "no_target") else parts[0]
+                real_why[(result.case_id, tile.visual_id)] = "tìm ra" if tile.found else short
 
-
-def steps_of(result):
-    try:
-        steps = json.loads(result.tool_calls_log[-1])["steps"]
-    except (IndexError, ValueError, KeyError, TypeError):
-        return []
-    return [step for step in steps if isinstance(step, dict)]
-
-
-def last(steps, name):
-    return next((s for s in reversed(steps) if s.get("step") == name), {})
-
-
-def source_kind(code):
-    # "bảng:loại[:nguồn]" -> "loại[:nguồn]": bỏ tên bảng
-    parts = str(code).split(":")
-    for i in range(len(parts) - 1, 0, -1):
-        if parts[i] in ("external", "derived", "unresolved"):
-            return ":".join(parts[i:])
-    return "?"
+report_ids = sorted({case.report_id for case in case_list.cases})
+names = search.report_names(report_ids, allowed)
+reports = {rid: search.formula_report(rid, allowed) for rid in report_ids}
+candidates_of = {rid: number_candidates(r) for rid, r in reports.items() if r is not None}
 
 
 def bucket(n):
-    n = n or 0
-    return "0" if n == 0 else "1-5" if n <= 5 else "6-20" if n <= 20 else ">20"
+    return "0" if n == 0 else "1" if n == 1 else "2-3" if n <= 3 else "4-9" if n <= 9 else ">=10"
 
 
-all_codes = Counter()
-other = Counter()
-branch = Counter()
-no_match = Counter()
-no_sql = Counter()
-for result in results:
-    case = case_by_id.get(result.case_id, {})
-    expects = {t["tile"]["visual_id"]: t for t in case.get("tiles", [])}
-    steps = steps_of(result)
-    numbers = last(steps, "numbers")
-    formula = last(steps, "formula")
-    pick = last(steps, "llm_checks").get("calls", {}).get("pick_numbers", {})
-    for tile in result.tiles:
-        all_codes.update(tile.codes)
-        why = next((c[4:] for c in tile.codes if c.startswith("why:")), "")
-        expect = expects.get(tile.visual_id, {})
-        if why.startswith("other_tile:other_measure"):
-            other.update(f"kết quả khớp:{o}" for o in numbers.get("outcomes") or [])
-            other.update(f"loại tên:{k}" for k in numbers.get("name_kinds") or [])
-            other[f"cụm chữ/ô hỏi:{numbers.get('phrases', 0)}/{len(expects)}"] += 1
-        if why == "no_target:branch_listing":
-            formula = next(
-                (
-                    s
-                    for s in reversed(steps)
-                    if s.get("step") == "formula" and s.get("outcome") == "branch_listing"
-                ),
-                formula,
-            )
-            branch[f"kiểu câu:{result.kind}"] += 1
-            branch[f"bài kiểm biết nhánh:{'có' if expect.get('branch') else 'không'}"] += 1
-            branch[f"lọc trên ảnh:{bucket(len(case.get('slicer_values') or []))}"] += 1
-            branch[f"lọc trong câu:{bucket(len(case.get('question_values') or []))}"] += 1
-            branch[f"bot biết nhánh từ:{formula.get('branch_source')}"] += 1
-            branch[f"nhánh chưa chọn:{bucket(formula.get('unpicked_branches'))}"] += 1
-            branch[f"cột chờ chọn:{bucket(len(formula.get('unpicked_columns') or []))}"] += 1
-        if why.startswith("no_target:no_match"):
-            no_match[f"ứng viên:{bucket(numbers.get('candidates'))}"] += 1
-            no_match.update(f"kết quả khớp:{o}" for o in numbers.get("outcomes") or [])
-            for key in ("errors", "rules", "checks"):
-                no_match.update(f"model chọn {key}:{c}" for c in pick.get(key) or [])
-    for step in steps:
-        if step.get("step") != "formula" or step.get("sql_status") != "blocked":
+def visual_of(report, page_id, visual_id):
+    page = next((p for p in report.pages if p.page_id == page_id), None)
+    visual = next((v for v in page.visuals if v.visual_id == visual_id), None) if page else None
+    return page, visual
+
+
+def flow_targets(outcome):
+    """(settled visual ids, measures without tile, sent to model, asked: has right option?)"""
+    kind = type(outcome).__name__
+    settled, measures, asked = [], [], None
+    pick = getattr(outcome, "pick", None)
+    unsettled = set(pick.unsettled) if pick is not None else set()
+    free = pick is not None and not pick.unsettled
+    if isinstance(outcome, loc.Detailed) and not free:
+        settled.append(outcome.target)
+    if isinstance(outcome, loc.Numbers) and not free:
+        settled.extend(
+            item.target
+            for position, item in enumerate(outcome.items)
+            if item.target is not None and position not in unsettled
+        )
+    ask = outcome if isinstance(outcome, loc.AskNumber) else getattr(outcome, "near", None)
+    if ask is not None:
+        asked = [read_number_key(option.key) for option in ask.options]
+    tiles = {t.visual_id for t in settled if t.visual_id}
+    for t in settled:
+        if not t.visual_id and t.measure_name:
+            measures.append(t.measure_name)
+    return kind, tiles, measures, pick is not None, asked, settled
+
+
+flow = Counter()
+flow_by_kind = Counter()
+lines = Counter()
+same_words = Counter()
+won = Counter()
+real_vs = Counter()
+for case in case_list.cases:
+    report = reports.get(case.report_id)
+    if report is None:
+        flow["báo cáo ngoài quyền xem"] += 1
+        continue
+    name = names.get(case.report_id, case.report_id)
+    question = case.turns[0]
+    mentions = (Mention(phrase=name, term_ids=(), report=name),)
+    sub = SubQuestion(index=0, text=question, kind="formula", mentions=mentions)
+    attachments = (
+        (Attachment(name=IMAGE_NAME, kind="image", text=case.image_text, cut=False),)
+        if case.image_text
+        else ()
+    )
+    outcome = loc.locate(
+        subs=(sub,), question=question, attachments=attachments, knowledge=search, allowed=allowed
+    )
+    kind, tiles, measures, to_model, asked, settled = flow_targets(outcome)
+    twins = twins_of(case, report)
+    candidates = candidates_of[case.report_id]
+    # một tên chỉ tiêu thắng ngay (giả thuyết của 30 ô bóc nhầm)
+    measures_found, how = loc._asked_measures(report, mentions, question, case.image_text)
+    asked_measures = {expect.tile.measure for expect in case.tiles}
+    if len(measures_found) == 1 and how != "concept":
+        right = "đúng" if measures_found[0] in asked_measures else "sai"
+        image_lines = {normalize_name(x) for x in (case.image_text or "").splitlines()}
+        where = "ảnh" if normalize_name(measures_found[0]) in image_lines else "câu"
+        won[f"{case.kind} {how} từ {where} {right}"] += 1
+    shown_pages = (
+        loc._on_screenshot_pages(report, candidates, mentions, question, case.image_text)
+        if case.image_text
+        else candidates
+    )
+    for expect in case.tiles:
+        tile = expect.tile
+        alike = {tile.visual_id, *twins.get(tile.visual_id, ())}
+        if tiles & alike:
+            result = "code tìm đúng"
+        elif to_model:
+            result = "đưa model chọn"
+        elif asked is not None:
+            right = any(key and key[1] in alike for key in asked)
+            result = f"hỏi lại, {'có' if right else 'không có'} nút đúng"
+        elif tiles:
+            same = any(t.measure_name == tile.measure for t in settled if t.visual_id)
+            result = f"code chọn ô khác ({'cùng' if same else 'khác'} chỉ tiêu)"
+        elif tile.measure in measures:
+            result = "chỉ ra chỉ tiêu, không ra ô"
+        else:
+            result = f"không ra ô ({kind})"
+        flow[result] += 1
+        flow_by_kind[f"{case.kind}: {result}"] += 1
+        if (case.case_id, tile.visual_id) in real_why:
+            real_vs[f"thật {real_why[(case.case_id, tile.visual_id)]} | code: {result}"] += 1
+        if not case.image_text:
             continue
-        no_sql[f"chặn:{','.join(step.get('sql_blocks') or []) or 'không mã'}"] += 1
-        no_sql.update(f"nguồn ngoài:{source_kind(c)}" for c in step.get("external_tables") or [])
-        no_sql[f"tầng cắt:{bucket(step.get('cut_levels'))}"] += 1
-        no_sql[f"cây:{step.get('outcome')}"] += 1
+        # từng dòng chữ của chính ô đó trên ảnh
+        page, visual = visual_of(report, tile.page_id, tile.visual_id)
+        if visual is None:
+            lines["ô không còn trong publish"] += 1
+            continue
+        if face.is_covered(page, visual):
+            lines["ô bị che: ảnh chỉ có số"] += 1
+            continue
+        words = face.tile_words(report, page, visual).shown
+        if not words:
+            lines["ô không có chữ"] += 1
+            continue
+        best = "không giống ô nào"
+        rank = {
+            "khớp chắc đúng ô": 0,
+            "hoà, có ô này": 1,
+            "gần đúng ô (chưa chắc)": 2,
+            "khớp chắc ô khác": 3,
+            "gần ô khác (chưa chắc)": 4,
+            "hoà, không có ô này": 5,
+            "không giống ô nào": 6,
+        }
+        tie_alike_words = 0
+        for word in words:
+            found = match(candidates, word)
+            if found.outcome == "tie" and len(shown_pages) < len(candidates):
+                found = match(shown_pages, word)
+            ids = {s.candidate.visual_id for s in found.best}
+            if found.outcome == "sure":
+                label = "khớp chắc đúng ô" if ids & alike else "khớp chắc ô khác"
+            elif found.outcome == "assumed":
+                label = "gần đúng ô (chưa chắc)" if ids & alike else "gần ô khác (chưa chắc)"
+            elif found.outcome == "tie":
+                tied = ids | {s.candidate.visual_id for s in found.close}
+                label = "hoà, có ô này" if tied & alike else "hoà, không có ô này"
+                names_tied = {
+                    normalize_name(s.name.text) for s in (*found.best, *found.close)
+                }
+                if len(names_tied) == 1:
+                    tie_alike_words += 1
+            else:
+                label = "không giống ô nào"
+            if rank[label] < rank[best]:
+                best = label
+        lines[best] += 1
+        if best == "hoà, có ô này":
+            lines["(trong số hoà có ô này: chữ y hệt ô khác)"] += 1 if tie_alike_words else 0
+        # bao nhiêu ô khác trên cùng trang hiện đúng một chữ của ô này
+        own = {normalize_name(w) for w in words}
+        others = sum(
+            1
+            for other in page.visuals
+            if other.visual_id not in alike
+            and own & {normalize_name(w) for w in face.tile_words(report, page, other).shown}
+        )
+        same_words[f"chung chữ với {bucket(others)} ô khác"] += 1
 
 
 def show(title, counter):
-    items = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+    items = sorted(((k, n) for k, n in counter.items() if n), key=lambda x: (-x[1], x[0]))
     text = f"{title}: " + " · ".join(f"{k} {n}" for k, n in items)
     print(textwrap.fill(text, width=100, subsequent_indent="    ", break_on_hyphens=False))
 
 
-print(f"Lần chạy {summary.run_key[:40]} · câu {len(results)} · ô {sum(len(r.tiles) for r in results)}")
-show("A. Mọi mã theo ô", all_codes)
-show("B. Ô bot chọn ô khác, chỉ tiêu khác", other)
-show("C. Ô bot liệt kê nhánh", branch)
-show("D. Ô model không thấy ô nào khớp", no_match)
-show("E. Bước bóc bị chặn SQL", no_sql)
+tile_count = sum(len(case.tiles) for case in case_list.cases)
+print(f"Danh sách {'lớn' if BIG_LIST else 'đã lưu'} · câu {len(case_list.cases)} · ô {tile_count}")
+show("A. Code tự tìm (không model)", flow)
+show("A2. Theo kiểu câu", flow_by_kind)
+show("B. Chữ của chính ô trên ảnh", lines)
+show("C. Ô có chung chữ với ô khác cùng trang", same_words)
+show("D. Một tên chỉ tiêu thắng ngay (theo câu)", won)
+if real_vs:
+    show("E. Lần chạy thật so với code", real_vs)
