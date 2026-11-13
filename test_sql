@@ -1,12 +1,14 @@
-# Ô đọc nguyên nhân hai lỗi thử tay: không ra SQL, DAX in dài (018 đợt 2).
-# Chạy ở notebook agent_chat, sau ô `%run ./reportez_setup`. Không gọi model, không ghi gì.
-# Chỉ đọc các câu của CHÍNH ANH trong bảng lịch sử chat của app, và chỉ in mã và số đếm:
-# không in câu hỏi, câu trả lời, tên báo cáo, trang, bảng, cột hay giá trị nào.
+# Ô đọc HÌNH DẠNG công thức lớn (018 đợt 2): vì sao DAX in dài và SQL thiếu giá trị lọc.
+# Chạy ở notebook agent_chat, sau ô `%run ./reportez_setup` VÀ ô Cấu hình. Không gọi model, không ghi gì.
+# Đọc các câu của CHÍNH ANH trong bảng lịch sử chat, lấy các công thức bot đã lưu, và chỉ in mã và số:
+# không in tên báo cáo, trang, ô, bảng, cột, chỉ tiêu, nhãn hay giá trị nào.
 SO_NGAY = 3  # đọc các câu trong mấy ngày gần đây
-SO_CAU = 20  # tối đa bao nhiêu câu trả lời gần nhất
+SO_CAU = 3  # chỉ đọc mấy câu trả lời gần nhất có lưu công thức
+DAI_TU = 1000  # chỉ xem công thức dài từ chừng này ký tự
 
 import json
 import re
+import textwrap
 from collections import Counter
 
 from chatbot.agent.history import quoted_table
@@ -15,28 +17,28 @@ TABLE = quoted_table(CHAT_HISTORY_TABLE)
 ME = spark.sql("SELECT current_user()").first()[0]
 ROWS = spark.sql(
     f"""
-    SELECT role, content, reply_meta, tool_calls_log, rptdate_detail, conversation_code
+    SELECT role, reply_meta, rptdate_detail
     FROM {TABLE}
-    WHERE user_email = :me AND rptdate_detail >= date_sub(current_date(), {int(SO_NGAY)})
+    WHERE user_email = :me AND role = 'assistant'
+      AND rptdate_detail >= date_sub(current_date(), {int(SO_NGAY)})
     ORDER BY rptdate_detail DESC
-    LIMIT {int(SO_CAU) * 3}
+    LIMIT 60
     """,
     args={"me": ME},
 ).collect()
 
-DAX_BLOCK = re.compile(r"```dax\s(.*?)```", re.DOTALL | re.IGNORECASE)
-SQL_BLOCK = re.compile(r"```sql\s(.*?)```", re.DOTALL | re.IGNORECASE)
-WORDS = {
-    "SWITCH": re.compile(r"\bSWITCH\s*\(", re.IGNORECASE),
-    "IF": re.compile(r"\bIF\s*\(", re.IGNORECASE),
-    "VAR": re.compile(r"\bVAR\s", re.IGNORECASE),
-    "CALCULATE": re.compile(r"\bCALCULATE\s*\(", re.IGNORECASE),
-}
-OUTSIDE_KINDS = ("external", "derived", "unresolved")
+SELECTORS = ("SELECTEDVALUE", "VALUES", "MAX", "MIN", "FIRSTNONBLANK", "LASTNONBLANK")
+COLUMN = re.compile(r"(?:'[^']+'|[A-Za-z_][\w.]*)\[[^\]]+\]")
+HEAD_CALL = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+NAME_ONLY = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
+NUMBER = re.compile(r"\s*-?\d+(?:\.\d+)?\s*$")
+VAR_DEF = re.compile(r"\bVAR\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
+VAR_END = re.compile(r"\b(?:VAR|RETURN)\b", re.IGNORECASE)
+SWITCH = re.compile(r"\bSWITCH\s*\(", re.IGNORECASE)
+CALC = re.compile(r"\bCALCULATE(?:TABLE)?\s*\(", re.IGNORECASE)
 
 
 def loaded(text):
-    """JSON thành dict; chuỗi rỗng hay hỏng thì {}."""
     if isinstance(text, dict):
         return text
     try:
@@ -46,116 +48,287 @@ def loaded(text):
     return value if isinstance(value, dict) else {}
 
 
-def has_word(text, word):
-    return "có" if re.search(rf"\b{word}\b", text or "", re.IGNORECASE) else "không"
+def masked(dax):
+    """Cùng độ dài với ``dax``; ruột của chuỗi, tên trong [] và '', chú thích thành dấu cách, để
+    ngoặc và dấu phẩy nằm trong đó không bị đếm."""
+    out = list(dax)
+    i, n = 0, len(dax)
+    while i < n:
+        two = dax[i : i + 2]
+        if two in ("--", "//"):
+            end = dax.find("\n", i)
+            end = n if end < 0 else end
+            out[i:end] = " " * (end - i)
+            i = end
+        elif two == "/*":
+            end = dax.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out[i:end] = " " * (end - i)
+            i = end
+        elif dax[i] in "\"'[":
+            close = "]" if dax[i] == "[" else dax[i]
+            j = i + 1
+            while j < n:
+                if dax[j] == close:
+                    if close != "]" and dax[j + 1 : j + 2] == close:  # "" hay '' là một dấu nháy
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out[i + 1 : j] = " " * (j - i - 1)
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
 
 
-def codes(values):
-    return "[" + ", ".join(str(v) for v in values or ()) + "]"
+def call_args(mask, open_at):
+    """(vị trí đóng ngoặc, [(đầu, cuối) của từng đối số]) của lời gọi mở ngoặc ở ``open_at``."""
+    depth, start, args = 0, open_at + 1, []
+    for i in range(open_at, len(mask)):
+        char = mask[i]
+        if char in "({":
+            depth += 1
+        elif char in ")}":
+            depth -= 1
+            if depth == 0:
+                args.append((start, i))
+                return i, args
+        elif char == "," and depth == 1:
+            args.append((start, i))
+            start = i + 1
+    return len(mask), args
 
 
-def kinds_only(tables):
-    """ "bảng:loại[:kiểu nguồn]" -> "loại[:kiểu nguồn]": không in tên bảng."""
+def head_kind(dax, mask, lo, hi, variables):
+    """Loại của một biểu thức theo chữ đầu: hàm DAX, biến, chỉ tiêu, chữ, số."""
+    text, shape = dax[lo:hi], mask[lo:hi]
+    if not shape.strip():
+        return "trống"
+    stripped = shape.strip()
+    if stripped.upper() in ("TRUE", "TRUE()") or re.fullmatch(r"TRUE\s*\(\s*\)", stripped, re.I):
+        return "TRUE"
+    if stripped.startswith('"'):
+        return "chữ"
+    if NUMBER.match(text):
+        return "số"
+    if stripped.startswith("["):
+        return "chỉ tiêu"
+    call = HEAD_CALL.match(shape)
+    if call:
+        return call.group(1).upper()
+    name = NAME_ONLY.match(shape)
+    if name:
+        inner = variables.get(name.group(1).casefold())
+        return f"biến→{inner}" if inner else "biến"
+    return "biểu thức"
+
+
+def test_kind(dax, mask, lo, hi, variables):
+    """Loại của một điều kiện trong SWITCH(TRUE(), …)."""
+    shape = mask[lo:hi]
+    if re.search(r"&&|\|\||\bAND\s*\(|\bOR\s*\(", shape, re.I):
+        return "ghép nhiều điều kiện"
+    if re.search(r"\bIN\s*\{", shape, re.I):
+        return "IN danh sách"
+    if re.search(r"<>|<=|>=|<|>", shape):
+        return "so sánh lớn nhỏ"
+    if shape.count("=") == 1:
+        left, right = shape.split("=")
+        at = lo + len(left) + 1
+        sides = (head_kind(dax, mask, lo, at - 1, variables), head_kind(dax, mask, at, hi, variables))
+        return "bằng: " + " = ".join(sides)
+    return "khác: " + head_kind(dax, mask, lo, hi, variables)
+
+
+def variables_of(dax, mask):
+    """tên biến -> loại của biểu thức gán cho nó (theo chữ đầu), và tên biến -> các cột nó đọc."""
+    found, columns = {}, {}
+    for match in VAR_DEF.finditer(mask):
+        end = VAR_END.search(mask, match.end())
+        hi = end.start() if end else len(mask)
+        name = match.group(1).casefold()
+        found[name] = head_kind(dax, mask, match.end(), hi, {})
+        columns[name] = {
+            item.group(0).replace(" ", "").casefold() for item in COLUMN.finditer(dax[match.end() : hi])
+        }
+    return found, columns
+
+
+def columns_in(dax, mask, lo, hi, variable_columns):
+    """Các cột một đoạn công thức đọc, kể cả qua biến nó gọi."""
+    found = {match.group(0).replace(" ", "").casefold() for match in COLUMN.finditer(dax[lo:hi])}
+    for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", mask[lo:hi]):
+        found |= variable_columns.get(word.casefold(), set())
+    return found
+
+
+def switches_of(dax):
+    """Mỗi SWITCH một dict mã và số; kèm tập cột nó dựa vào để chọn nhánh (không in ra)."""
+    mask = masked(dax)
+    variables, variable_columns = variables_of(dax, mask)
+    spans = []
+    for match in SWITCH.finditer(mask):
+        close, args = call_args(mask, match.end() - 1)
+        spans.append((match.start(), close, args))
     out = []
-    for item in tables or ():
-        parts = str(item).split(":")
-        at = next((i for i, part in enumerate(parts) if part in OUTSIDE_KINDS), None)
-        out.append(":".join(parts[at:]) if at is not None else "khác")
-    return codes(out)
+    for start, close, args in spans:
+        if not args:
+            continue
+        selector = head_kind(dax, mask, *args[0], variables)
+        rest = args[1:]
+        pairs = [(rest[i], rest[i + 1]) for i in range(0, len(rest) - 1, 2)]
+        default = len(rest) % 2 == 1
+        if selector == "TRUE":
+            tests = Counter(test_kind(dax, mask, *test, variables) for test, _ in pairs)
+        else:
+            tests = Counter(head_kind(dax, mask, *test, variables) for test, _ in pairs)
+        picks = columns_in(dax, mask, *args[0], variable_columns)
+        if selector == "TRUE":
+            for test, _ in pairs:
+                picks |= columns_in(dax, mask, *test, variable_columns)
+        results = [result for _, result in pairs] + ([rest[-1]] if default else [])
+        out.append(
+            {
+                "sâu": sum(1 for s, c, _ in spans if s < start and close < c),
+                "chọn theo": selector,
+                "nhánh": len(pairs),
+                "mặc định": "có" if default else "không",
+                "điều kiện": dict(tests),
+                "cột trong điều kiện": len(picks),
+                "nhánh có CALCULATE": sum(1 for lo, hi in results if CALC.search(mask[lo:hi])),
+                "nhánh lồng SWITCH": sum(1 for lo, hi in results if SWITCH.search(mask[lo:hi])),
+                "nhánh chỉ gọi một chỉ tiêu": sum(
+                    1 for lo, hi in results if re.fullmatch(r"\s*\[\s*\]\s*", mask[lo:hi])
+                ),
+                "ký tự": close - start,
+                "_cột": picks,
+            }
+        )
+    return out, variables
 
 
-def dax_shape(dax):
-    counts = " · ".join(f"{name} {len(rule.findall(dax))}" for name, rule in WORDS.items())
-    return f"{len(dax)} ký tự · {dax.count(chr(10)) + 1} dòng · {counts}"
+def tile_lines(formula, picks):
+    """Ô của công thức này trên báo cáo, theo bản publish: chỉ loại và số đếm."""
+    try:
+        from chatbot.knowledge import AllowedDivisions
 
+        allowed = AllowedDivisions.parse(globals().get("DIVISIONS", "CIBG"))
+        report = search.formula_report(formula.get("report_id") or "", allowed)
+    except Exception as exc:  # ô chẩn đoán: không đọc được publish thì vẫn in phần còn lại
+        return [f"  ô: không đọc được bản publish ({type(exc).__name__})"]
+    if report is None:
+        return ["  ô: báo cáo không nằm trong quyền xem đang đặt"]
+    measure = report.measures.get(formula.get("measure_name") or "")
+    lines = []
+    if measure is not None and measure.dax:
+        lines.append(
+            f"  chỉ tiêu được hỏi: công thức gốc {len(measure.dax)} ký tự · gọi {len(measure.depends_on)}"
+            " chỉ tiêu khác"
+        )
+    found = [
+        (page, visual)
+        for page in report.pages
+        for visual in page.visuals
+        if visual.visual_id == formula.get("visual_id")
+    ]
+    if not found:
+        return [*lines, "  ô: câu trả lời không gắn với ô nào (hỏi theo tên chỉ tiêu)"]
+    page, visual = found[0]
 
-def formula_lines(label, formula, tally):
-    yield (
-        f"  lưu {label}: sql_status={formula.get('sql_status')} · có SQL="
-        f"{'có' if formula.get('sql') else 'không'} · lời lý do không có SQL "
-        f"{len(formula.get('sql_reason') or '')} ký tự · bước Power Query SQL chưa tính "
-        f"{len(formula.get('steps_not_in_sql') or ())} · tham số {len(formula.get('placeholders') or ())}"
-        f" · đã chọn nhánh={'có' if formula.get('branch_value') else 'không'}"
+    def key(table, column):
+        return f"{table}[{column}]".replace(" ", "").replace("'", "").casefold()
+
+    wanted = {pick.replace("'", "") for pick in picks}
+    columns = [f for f in visual.fields if f.kind == "column"]
+    numbers = [f for f in visual.fields if f.kind in ("measure", "aggregation")]
+    split = sum(1 for f in columns if key(f.table, f.name) in wanted)
+    filtered = sum(1 for f in visual.filters if key(f.table, f.column) in wanted)
+    slicers = [v for v in page.visuals if v.slicer is not None]
+    on_pick = sum(
+        1 for v in slicers if any(key(f.table, f.name) in wanted for f in v.fields if f.kind == "column")
     )
-    stored = formula.get("formulas") or ()
-    tally["tầng có DAX lưu lại"] += len(stored)
-    for item in stored:
-        if isinstance(item, (list, tuple)) and len(item) == 3:
-            yield f"    DAX tầng {item[0]}: {dax_shape(str(item[2]))}"
-
-
-def turn_lines(number, question, row, tally):
-    meta = loaded(row["reply_meta"])
-    content = row["content"] or ""
-    dax_blocks = DAX_BLOCK.findall(content)
-    sql_blocks = SQL_BLOCK.findall(content)
-    yield (
-        f"Câu {number} · hỏi có chữ sql={has_word(question, 'sql')}, dax={has_word(question, 'dax')}"
-        f", code={has_word(question, 'code')} · trả lời kiểu {meta.get('action')}/{meta.get('rule_id')}"
-        f" · dài {len(content)} ký tự · khối DAX {len(dax_blocks)} ({sum(map(len, dax_blocks))} ký tự)"
-        f" · khối SQL {len(sql_blocks)} ({sum(map(len, sql_blocks))} ký tự)"
-    )
-    for block in dax_blocks:
-        yield f"    DAX in ra: {dax_shape(block)}"
-    steps = loaded(row["tool_calls_log"]).get("steps") or ()
-    steps = [loaded(step) for step in steps]
-    formula_steps = [step for step in steps if step.get("step") == "formula"]
-    if not steps:
-        yield "  (không có nhật ký của câu này)"
-    elif not formula_steps:
-        names = Counter(str(step.get("step")) for step in steps)
-        yield "  không có bước bóc công thức; các bước: " + codes(sorted(names))
-    for step in formula_steps:
-        tally[f"outcome {step.get('outcome')}"] += 1
-        tally[f"sql_status {step.get('sql_status')}"] += 1
-        for check in step.get("sql_checks") or ():
-            tally[f"sql_check {check}"] += 1
-        for block in step.get("sql_blocks") or ():
-            tally[f"sql_block {block}"] += 1
-        yield (
-            f"  bóc: outcome={step.get('outcome')} · reason={step.get('reason')} · found_by="
-            f"{step.get('found_by')} · tầng {step.get('levels')} · lọc {step.get('filters')} · nối "
-            f"{step.get('joins')} · dài {step.get('tree_tokens')} · cắt {step.get('cut_levels')} tầng"
-            f" · gọi model {step.get('calls')} · sửa lại {step.get('retries')} · lỗi "
-            f"{codes(step.get('errors'))} · kiểm chữ {codes(step.get('checks'))}"
-        )
-        yield (
-            f"  SQL: sql_status={step.get('sql_status')} · kế hoạch={step.get('sql_plan')} · chặn "
-            f"{codes(step.get('sql_blocks'))} · chỗ trống {step.get('sql_gaps')} · theo ô "
-            f"{step.get('sql_as_tile')} · bảng Power BI {step.get('sql_pbi_tables')} · kiểm SQL "
-            f"{codes(step.get('sql_checks'))} · hiện SQL={step.get('sql_shown')} · hiện DAX="
-            f"{step.get('dax_shown')} · bảng ngoài kho {kinds_only(step.get('external_tables'))}"
-        )
-        yield (
-            f"  nhánh: branch_source={step.get('branch_source')} · nhánh chưa chọn "
-            f"{step.get('unpicked_branches')} · cột chờ chọn {len(step.get('unpicked_columns') or ())}"
-            f" · lý do không có mặc định={step.get('branch_no_default')}"
-        )
-    if meta.get("formula"):
-        yield from formula_lines("(một số)", loaded(meta["formula"]), tally)
-    for position, item in enumerate(meta.get("numbers") or (), start=1):
-        yield from formula_lines(f"(số {position})", loaded(loaded(item).get("formula")), tally)
-
-
-def report(rows):
-    """Các dòng in ra: câu mới nhất trước; cuối cùng là bảng đếm."""
-    ordered = sorted(rows, key=lambda row: (str(row["rptdate_detail"]), row["role"] != "user"))
-    asked = {}
-    turns = []
-    for row in ordered:
-        if row["role"] == "user":
-            asked[row["conversation_code"]] = row["content"] or ""
-        elif row["role"] == "assistant":
-            turns.append((asked.get(row["conversation_code"], ""), row))
-    turns = turns[::-1][: int(SO_CAU)]
-    tally = Counter()
-    lines = [f"Đọc {len(turns)} câu trả lời gần nhất trong {int(SO_NGAY)} ngày (mới nhất trước)."]
-    for number, (question, row) in enumerate(turns, start=1):
-        lines.extend(turn_lines(number, question, row, tally))
     lines.append(
-        "Đếm: " + " · ".join(f"{name} {count}" for name, count in sorted(tally.items()))
+        f"  ô: loại {visual.visual_type} · {len(numbers)} trường số · {len(columns)} trường cột · "
+        f"trong đó {split} cột là cột chọn nhánh · lọc của ô trên cột chọn nhánh {filtered} · trang có "
+        f"{len(slicers)} slicer, {on_pick} cái trên cột chọn nhánh"
     )
     return lines
 
 
-print("\n".join(report(ROWS)))
+def formula_lines(label, formula):
+    stored = [
+        item
+        for item in formula.get("formulas") or ()
+        if isinstance(item, (list, tuple)) and len(item) == 3
+    ]
+    picks = set()
+    lines = [
+        f" {label}: {len(stored)} tầng có DAX · đã chọn nhánh="
+        f"{'có' if formula.get('branch_value') else 'không'} · gắn với ô="
+        f"{'có' if formula.get('visual_id') else 'không'} · sql_status={formula.get('sql_status')}"
+    ]
+    for number, _, dax in stored:
+        dax = str(dax)
+        found, variables = switches_of(dax)
+        if len(dax) < int(DAI_TU) and not found:
+            continue
+        kinds = Counter(variables.values())
+        lines.append(
+            f"  tầng {number}: {len(dax)} ký tự · {dax.count(chr(10)) + 1} dòng · CALCULATE "
+            f"{len(CALC.findall(masked(dax)))} · biến {len(variables)} {dict(kinds)} · SWITCH {len(found)}"
+        )
+        for position, item in enumerate(found, start=1):
+            picks |= item["_cột"]
+            shown = " · ".join(f"{name} {value}" for name, value in item.items() if name != "_cột")
+            lines.append(f"    SWITCH {position}: {shown}")
+    if "search" in globals():
+        lines.extend(tile_lines(formula, picks))
+    return lines
+
+
+def report(rows):
+    lines, seen, turns = [], set(), 0
+    for row in rows:
+        meta = loaded(row["reply_meta"])
+        formulas = [("một số", loaded(meta.get("formula")))] if meta.get("formula") else []
+        formulas += [
+            (f"số {position}", loaded(loaded(item).get("formula")))
+            for position, item in enumerate(meta.get("numbers") or (), start=1)
+        ]
+        formulas = [(label, formula) for label, formula in formulas if formula.get("formulas")]
+        if not formulas:
+            continue
+        turns += 1
+        lines.append(f"Câu trả lời {turns} (mới nhất trước) · lưu {len(formulas)} công thức")
+        for label, formula in formulas:
+            mark = json.dumps(formula.get("formulas"), ensure_ascii=False, sort_keys=True)
+            mark = (formula.get("visual_id"), mark)
+            if mark in seen:
+                lines.append(f" {label}: giống một công thức đã in ở trên")
+                continue
+            seen.add(mark)
+            lines.extend(formula_lines(label, formula))
+        if turns >= int(SO_CAU):
+            break
+    return lines or ["Không có câu trả lời nào lưu công thức trong mấy ngày này."]
+
+
+def wrapped(line):
+    indent = " " * (len(line) - len(line.lstrip()) + 4)
+    return textwrap.fill(line, width=100, subsequent_indent=indent, break_on_hyphens=False)
+
+
+if "search" not in globals():
+    try:
+        import dataclasses
+
+        from chatbot.config import load_agent_config
+        from chatbot.knowledge import KnowledgeSearch
+
+        _retrieval = dataclasses.replace(load_agent_config().retrieval, refresh_seconds=0)
+        search = KnowledgeSearch.from_config(_retrieval)
+    except Exception as exc:  # ô chẩn đoán: thiếu publish thì chỉ đọc phần công thức đã lưu
+        print(f"(không mở được bản publish: {type(exc).__name__}; chỉ đọc công thức đã lưu)")
+
+print("\n".join(wrapped(line) for line in report(ROWS)))
