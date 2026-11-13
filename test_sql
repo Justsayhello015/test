@@ -1,223 +1,161 @@
-# Ô đo tìm ô bằng code (018 đợt 2, bước 1). Chạy sau ô Cấu hình (cần DIVISIONS, FACETEST_DIR).
-# Không gọi model, không ghi file nào, chạy vài giây. Chỉ in mã và số đếm: không in tên báo cáo,
-# trang, ô, cột hay giá trị nào.
-# BIG_LIST = False: 50 câu của lần chạy ô 6 gần nhất (so được với kết quả thật).
-# BIG_LIST = True: tạo thêm danh sách lớn trong bộ nhớ (không lưu) để có nhiều ô hơn.
-BIG_LIST = False
-BIG_CASES, BIG_PER_REPORT = 400, 40
+# Ô đọc nguyên nhân hai lỗi thử tay: không ra SQL, DAX in dài (018 đợt 2).
+# Chạy ở notebook agent_chat, sau ô `%run ./reportez_setup`. Không gọi model, không ghi gì.
+# Chỉ đọc các câu của CHÍNH ANH trong bảng lịch sử chat của app, và chỉ in mã và số đếm:
+# không in câu hỏi, câu trả lời, tên báo cáo, trang, bảng, cột hay giá trị nào.
+SO_NGAY = 3  # đọc các câu trong mấy ngày gần đây
+SO_CAU = 20  # tối đa bao nhiêu câu trả lời gần nhất
 
-import dataclasses
-import textwrap
+import json
+import re
 from collections import Counter
-from pathlib import Path
 
-from chatbot.agent.types import Attachment, Mention, SubQuestion
-from chatbot.config import load_agent_config
-from chatbot.facetest.ask import IMAGE_NAME, twins_of
-from chatbot.facetest.cases import make_cases
-from chatbot.facetest.store import FaceTestStore
-from chatbot.formula import face
-from chatbot.formula import locate as loc
-from chatbot.formula.candidates import match, number_candidates, read_number_key
-from chatbot.knowledge import AllowedDivisions, KnowledgeSearch
-from chatbot.textnorm import normalize_name
+from chatbot.agent.history import quoted_table
 
-if "search" not in globals():
-    config = load_agent_config()
-    retrieval = dataclasses.replace(config.retrieval, refresh_seconds=0)
-    search = KnowledgeSearch.from_config(retrieval)
-allowed = AllowedDivisions.parse(DIVISIONS)
-store = FaceTestStore(Path(FACETEST_DIR))
-real_why: dict[tuple[str, str], str] = {}
-if BIG_LIST:
-    run_id = search.check().run_id
-    case_list = make_cases(
-        search, allowed, run_id=run_id, cases=BIG_CASES, per_report=BIG_PER_REPORT, made_at=""
+TABLE = quoted_table(CHAT_HISTORY_TABLE)
+ME = spark.sql("SELECT current_user()").first()[0]
+ROWS = spark.sql(
+    f"""
+    SELECT role, content, reply_meta, tool_calls_log, rptdate_detail, conversation_code
+    FROM {TABLE}
+    WHERE user_email = :me AND rptdate_detail >= date_sub(current_date(), {int(SO_NGAY)})
+    ORDER BY rptdate_detail DESC
+    LIMIT {int(SO_CAU) * 3}
+    """,
+    args={"me": ME},
+).collect()
+
+DAX_BLOCK = re.compile(r"```dax\s(.*?)```", re.DOTALL | re.IGNORECASE)
+SQL_BLOCK = re.compile(r"```sql\s(.*?)```", re.DOTALL | re.IGNORECASE)
+WORDS = {
+    "SWITCH": re.compile(r"\bSWITCH\s*\(", re.IGNORECASE),
+    "IF": re.compile(r"\bIF\s*\(", re.IGNORECASE),
+    "VAR": re.compile(r"\bVAR\s", re.IGNORECASE),
+    "CALCULATE": re.compile(r"\bCALCULATE\s*\(", re.IGNORECASE),
+}
+OUTSIDE_KINDS = ("external", "derived", "unresolved")
+
+
+def loaded(text):
+    """JSON thành dict; chuỗi rỗng hay hỏng thì {}."""
+    if isinstance(text, dict):
+        return text
+    try:
+        value = json.loads(text) if text else {}
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def has_word(text, word):
+    return "có" if re.search(rf"\b{word}\b", text or "", re.IGNORECASE) else "không"
+
+
+def codes(values):
+    return "[" + ", ".join(str(v) for v in values or ()) + "]"
+
+
+def kinds_only(tables):
+    """ "bảng:loại[:kiểu nguồn]" -> "loại[:kiểu nguồn]": không in tên bảng."""
+    out = []
+    for item in tables or ():
+        parts = str(item).split(":")
+        at = next((i for i, part in enumerate(parts) if part in OUTSIDE_KINDS), None)
+        out.append(":".join(parts[at:]) if at is not None else "khác")
+    return codes(out)
+
+
+def dax_shape(dax):
+    counts = " · ".join(f"{name} {len(rule.findall(dax))}" for name, rule in WORDS.items())
+    return f"{len(dax)} ký tự · {dax.count(chr(10)) + 1} dòng · {counts}"
+
+
+def formula_lines(label, formula, tally):
+    yield (
+        f"  lưu {label}: sql_status={formula.get('sql_status')} · có SQL="
+        f"{'có' if formula.get('sql') else 'không'} · lời lý do không có SQL "
+        f"{len(formula.get('sql_reason') or '')} ký tự · bước Power Query SQL chưa tính "
+        f"{len(formula.get('steps_not_in_sql') or ())} · tham số {len(formula.get('placeholders') or ())}"
+        f" · đã chọn nhánh={'có' if formula.get('branch_value') else 'không'}"
     )
-else:
-    case_list = store.read_cases()
-    last = store.last_finished()
-    if last is not None and last.list_id == case_list.list_id:
-        for result in store.read_results(last.run_key):
-            for tile in result.tiles:
-                why = next((c[4:] for c in tile.codes if c.startswith("why:")), "")
-                parts = why.split(":")
-                short = ":".join(parts[:2]) if parts[0] in ("other_tile", "no_target") else parts[0]
-                real_why[(result.case_id, tile.visual_id)] = "tìm ra" if tile.found else short
-
-report_ids = sorted({case.report_id for case in case_list.cases})
-names = search.report_names(report_ids, allowed)
-reports = {rid: search.formula_report(rid, allowed) for rid in report_ids}
-candidates_of = {rid: number_candidates(r) for rid, r in reports.items() if r is not None}
+    stored = formula.get("formulas") or ()
+    tally["tầng có DAX lưu lại"] += len(stored)
+    for item in stored:
+        if isinstance(item, (list, tuple)) and len(item) == 3:
+            yield f"    DAX tầng {item[0]}: {dax_shape(str(item[2]))}"
 
 
-def bucket(n):
-    return "0" if n == 0 else "1" if n == 1 else "2-3" if n <= 3 else "4-9" if n <= 9 else ">=10"
-
-
-def visual_of(report, page_id, visual_id):
-    page = next((p for p in report.pages if p.page_id == page_id), None)
-    visual = next((v for v in page.visuals if v.visual_id == visual_id), None) if page else None
-    return page, visual
-
-
-def flow_targets(outcome):
-    """(settled visual ids, measures without tile, sent to model, asked: has right option?)"""
-    kind = type(outcome).__name__
-    settled, measures, asked = [], [], None
-    pick = getattr(outcome, "pick", None)
-    unsettled = set(pick.unsettled) if pick is not None else set()
-    free = pick is not None and not pick.unsettled
-    if isinstance(outcome, loc.Detailed) and not free:
-        settled.append(outcome.target)
-    if isinstance(outcome, loc.Numbers) and not free:
-        settled.extend(
-            item.target
-            for position, item in enumerate(outcome.items)
-            if item.target is not None and position not in unsettled
+def turn_lines(number, question, row, tally):
+    meta = loaded(row["reply_meta"])
+    content = row["content"] or ""
+    dax_blocks = DAX_BLOCK.findall(content)
+    sql_blocks = SQL_BLOCK.findall(content)
+    yield (
+        f"Câu {number} · hỏi có chữ sql={has_word(question, 'sql')}, dax={has_word(question, 'dax')}"
+        f", code={has_word(question, 'code')} · trả lời kiểu {meta.get('action')}/{meta.get('rule_id')}"
+        f" · dài {len(content)} ký tự · khối DAX {len(dax_blocks)} ({sum(map(len, dax_blocks))} ký tự)"
+        f" · khối SQL {len(sql_blocks)} ({sum(map(len, sql_blocks))} ký tự)"
+    )
+    for block in dax_blocks:
+        yield f"    DAX in ra: {dax_shape(block)}"
+    steps = loaded(row["tool_calls_log"]).get("steps") or ()
+    steps = [loaded(step) for step in steps]
+    formula_steps = [step for step in steps if step.get("step") == "formula"]
+    if not steps:
+        yield "  (không có nhật ký của câu này)"
+    elif not formula_steps:
+        names = Counter(str(step.get("step")) for step in steps)
+        yield "  không có bước bóc công thức; các bước: " + codes(sorted(names))
+    for step in formula_steps:
+        tally[f"outcome {step.get('outcome')}"] += 1
+        tally[f"sql_status {step.get('sql_status')}"] += 1
+        for check in step.get("sql_checks") or ():
+            tally[f"sql_check {check}"] += 1
+        for block in step.get("sql_blocks") or ():
+            tally[f"sql_block {block}"] += 1
+        yield (
+            f"  bóc: outcome={step.get('outcome')} · reason={step.get('reason')} · found_by="
+            f"{step.get('found_by')} · tầng {step.get('levels')} · lọc {step.get('filters')} · nối "
+            f"{step.get('joins')} · dài {step.get('tree_tokens')} · cắt {step.get('cut_levels')} tầng"
+            f" · gọi model {step.get('calls')} · sửa lại {step.get('retries')} · lỗi "
+            f"{codes(step.get('errors'))} · kiểm chữ {codes(step.get('checks'))}"
         )
-    ask = outcome if isinstance(outcome, loc.AskNumber) else getattr(outcome, "near", None)
-    if ask is not None:
-        asked = [read_number_key(option.key) for option in ask.options]
-    tiles = {t.visual_id for t in settled if t.visual_id}
-    for t in settled:
-        if not t.visual_id and t.measure_name:
-            measures.append(t.measure_name)
-    return kind, tiles, measures, pick is not None, asked, settled
-
-
-flow = Counter()
-flow_by_kind = Counter()
-lines = Counter()
-same_words = Counter()
-won = Counter()
-real_vs = Counter()
-for case in case_list.cases:
-    report = reports.get(case.report_id)
-    if report is None:
-        flow["báo cáo ngoài quyền xem"] += 1
-        continue
-    name = names.get(case.report_id, case.report_id)
-    question = case.turns[0]
-    mentions = (Mention(phrase=name, term_ids=(), report=name),)
-    sub = SubQuestion(index=0, text=question, kind="formula", mentions=mentions)
-    attachments = (
-        (Attachment(name=IMAGE_NAME, kind="image", text=case.image_text, cut=False),)
-        if case.image_text
-        else ()
-    )
-    outcome = loc.locate(
-        subs=(sub,), question=question, attachments=attachments, knowledge=search, allowed=allowed
-    )
-    kind, tiles, measures, to_model, asked, settled = flow_targets(outcome)
-    twins = twins_of(case, report)
-    candidates = candidates_of[case.report_id]
-    # một tên chỉ tiêu thắng ngay (giả thuyết của 30 ô bóc nhầm)
-    measures_found, how = loc._asked_measures(report, mentions, question, case.image_text)
-    asked_measures = {expect.tile.measure for expect in case.tiles}
-    if len(measures_found) == 1 and how != "concept":
-        right = "đúng" if measures_found[0] in asked_measures else "sai"
-        image_lines = {normalize_name(x) for x in (case.image_text or "").splitlines()}
-        where = "ảnh" if normalize_name(measures_found[0]) in image_lines else "câu"
-        won[f"{case.kind} {how} từ {where} {right}"] += 1
-    shown_pages = (
-        loc._on_screenshot_pages(report, candidates, mentions, question, case.image_text)
-        if case.image_text
-        else candidates
-    )
-    for expect in case.tiles:
-        tile = expect.tile
-        alike = {tile.visual_id, *twins.get(tile.visual_id, ())}
-        if tiles & alike:
-            result = "code tìm đúng"
-        elif to_model:
-            result = "đưa model chọn"
-        elif asked is not None:
-            right = any(key and key[1] in alike for key in asked)
-            result = f"hỏi lại, {'có' if right else 'không có'} nút đúng"
-        elif tiles:
-            same = any(t.measure_name == tile.measure for t in settled if t.visual_id)
-            result = f"code chọn ô khác ({'cùng' if same else 'khác'} chỉ tiêu)"
-        elif tile.measure in measures:
-            result = "chỉ ra chỉ tiêu, không ra ô"
-        else:
-            result = f"không ra ô ({kind})"
-        flow[result] += 1
-        flow_by_kind[f"{case.kind}: {result}"] += 1
-        if (case.case_id, tile.visual_id) in real_why:
-            real_vs[f"thật {real_why[(case.case_id, tile.visual_id)]} | code: {result}"] += 1
-        if not case.image_text:
-            continue
-        # từng dòng chữ của chính ô đó trên ảnh
-        page, visual = visual_of(report, tile.page_id, tile.visual_id)
-        if visual is None:
-            lines["ô không còn trong publish"] += 1
-            continue
-        if face.is_covered(page, visual):
-            lines["ô bị che: ảnh chỉ có số"] += 1
-            continue
-        words = face.tile_words(report, page, visual).shown
-        if not words:
-            lines["ô không có chữ"] += 1
-            continue
-        best = "không giống ô nào"
-        rank = {
-            "khớp chắc đúng ô": 0,
-            "hoà, có ô này": 1,
-            "gần đúng ô (chưa chắc)": 2,
-            "khớp chắc ô khác": 3,
-            "gần ô khác (chưa chắc)": 4,
-            "hoà, không có ô này": 5,
-            "không giống ô nào": 6,
-        }
-        tie_alike_words = 0
-        for word in words:
-            found = match(candidates, word)
-            if found.outcome == "tie" and len(shown_pages) < len(candidates):
-                found = match(shown_pages, word)
-            ids = {s.candidate.visual_id for s in found.best}
-            if found.outcome == "sure":
-                label = "khớp chắc đúng ô" if ids & alike else "khớp chắc ô khác"
-            elif found.outcome == "assumed":
-                label = "gần đúng ô (chưa chắc)" if ids & alike else "gần ô khác (chưa chắc)"
-            elif found.outcome == "tie":
-                tied = ids | {s.candidate.visual_id for s in found.close}
-                label = "hoà, có ô này" if tied & alike else "hoà, không có ô này"
-                names_tied = {
-                    normalize_name(s.name.text) for s in (*found.best, *found.close)
-                }
-                if len(names_tied) == 1:
-                    tie_alike_words += 1
-            else:
-                label = "không giống ô nào"
-            if rank[label] < rank[best]:
-                best = label
-        lines[best] += 1
-        if best == "hoà, có ô này":
-            lines["(trong số hoà có ô này: chữ y hệt ô khác)"] += 1 if tie_alike_words else 0
-        # bao nhiêu ô khác trên cùng trang hiện đúng một chữ của ô này
-        own = {normalize_name(w) for w in words}
-        others = sum(
-            1
-            for other in page.visuals
-            if other.visual_id not in alike
-            and own & {normalize_name(w) for w in face.tile_words(report, page, other).shown}
+        yield (
+            f"  SQL: sql_status={step.get('sql_status')} · kế hoạch={step.get('sql_plan')} · chặn "
+            f"{codes(step.get('sql_blocks'))} · chỗ trống {step.get('sql_gaps')} · theo ô "
+            f"{step.get('sql_as_tile')} · bảng Power BI {step.get('sql_pbi_tables')} · kiểm SQL "
+            f"{codes(step.get('sql_checks'))} · hiện SQL={step.get('sql_shown')} · hiện DAX="
+            f"{step.get('dax_shown')} · bảng ngoài kho {kinds_only(step.get('external_tables'))}"
         )
-        same_words[f"chung chữ với {bucket(others)} ô khác"] += 1
+        yield (
+            f"  nhánh: branch_source={step.get('branch_source')} · nhánh chưa chọn "
+            f"{step.get('unpicked_branches')} · cột chờ chọn {len(step.get('unpicked_columns') or ())}"
+            f" · lý do không có mặc định={step.get('branch_no_default')}"
+        )
+    if meta.get("formula"):
+        yield from formula_lines("(một số)", loaded(meta["formula"]), tally)
+    for position, item in enumerate(meta.get("numbers") or (), start=1):
+        yield from formula_lines(f"(số {position})", loaded(loaded(item).get("formula")), tally)
 
 
-def show(title, counter):
-    items = sorted(((k, n) for k, n in counter.items() if n), key=lambda x: (-x[1], x[0]))
-    text = f"{title}: " + " · ".join(f"{k} {n}" for k, n in items)
-    print(textwrap.fill(text, width=100, subsequent_indent="    ", break_on_hyphens=False))
+def report(rows):
+    """Các dòng in ra: câu mới nhất trước; cuối cùng là bảng đếm."""
+    ordered = sorted(rows, key=lambda row: (str(row["rptdate_detail"]), row["role"] != "user"))
+    asked = {}
+    turns = []
+    for row in ordered:
+        if row["role"] == "user":
+            asked[row["conversation_code"]] = row["content"] or ""
+        elif row["role"] == "assistant":
+            turns.append((asked.get(row["conversation_code"], ""), row))
+    turns = turns[::-1][: int(SO_CAU)]
+    tally = Counter()
+    lines = [f"Đọc {len(turns)} câu trả lời gần nhất trong {int(SO_NGAY)} ngày (mới nhất trước)."]
+    for number, (question, row) in enumerate(turns, start=1):
+        lines.extend(turn_lines(number, question, row, tally))
+    lines.append(
+        "Đếm: " + " · ".join(f"{name} {count}" for name, count in sorted(tally.items()))
+    )
+    return lines
 
 
-tile_count = sum(len(case.tiles) for case in case_list.cases)
-print(f"Danh sách {'lớn' if BIG_LIST else 'đã lưu'} · câu {len(case_list.cases)} · ô {tile_count}")
-show("A. Code tự tìm (không model)", flow)
-show("A2. Theo kiểu câu", flow_by_kind)
-show("B. Chữ của chính ô trên ảnh", lines)
-show("C. Ô có chung chữ với ô khác cùng trang", same_words)
-show("D. Một tên chỉ tiêu thắng ngay (theo câu)", won)
-if real_vs:
-    show("E. Lần chạy thật so với code", real_vs)
+print("\n".join(report(ROWS)))
